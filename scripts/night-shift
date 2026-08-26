@@ -22,7 +22,7 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.0"
+VERSION="0.1.1"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
 
@@ -95,8 +95,9 @@ parse_duration() { # "8h" | "90m" -> seconds
 }
 
 # ---------- frontmatter (launcher-owned) ----------
-fm_get() { # fm_get FILE KEY
-  awk -v k="$2" 'NR==1&&$0!="---"{exit} /^---$/{c++; next} c==1 && $1==k":" {sub(/^[^:]*:[[:space:]]*/,""); print; exit}' "$1"
+fm_get() { # fm_get FILE KEY — strips inline YAML comments and trailing space
+  awk -v k="$2" 'NR==1&&$0!="---"{exit} /^---$/{c++; next} c==1 && $1==k":" {
+    sub(/^[^:]*:[[:space:]]*/,""); sub(/[[:space:]]+#.*$/,""); sub(/[[:space:]]+$/,""); print; exit}' "$1"
 }
 fm_set_status() { # fm_set_status FILE VALUE — portable (BSD sed has no 0,/re/ address)
   local f="$1" v="$2" tmp
