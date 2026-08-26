@@ -22,7 +22,7 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.1"
+VERSION="0.1.2"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
 
@@ -192,11 +192,20 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
 
   log "feature $name (base: $base)"
   # worktree + branch (reuse when resuming)
-  if [ ! -d "$wt" ]; then
+  # speckit's planning chain leaves the main checkout ON the feature branch —
+  # git refuses a second checkout of the same branch, so work there directly.
+  local cur; cur="$(git -C "$repo" branch --show-current 2>/dev/null)"
+  if [ "$cur" = "$name" ]; then
+    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+      warn "$name is checked out at the repo root with uncommitted changes — commit/stash first"; return 1
+    fi
+    wt="$repo"
+    log "  using main checkout (already on branch $name, clean)"
+  elif [ ! -d "$wt" ]; then
     if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
-      git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { warn "worktree add failed"; return 1; }
+      git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
     else
-      git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { warn "worktree add failed"; return 1; }
+      git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
     fi
     [ -x "$repo/.agent/setup.sh" ] && ( cd "$wt" && bash "$repo/.agent/setup.sh" ) >>"$runlog" 2>&1
   fi
