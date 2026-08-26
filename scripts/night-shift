@@ -22,7 +22,7 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.3"
+VERSION="0.1.4"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
 
@@ -95,9 +95,38 @@ parse_duration() { # "8h" | "90m" -> seconds
 }
 
 # ---------- frontmatter (launcher-owned) ----------
-fm_get() { # fm_get FILE KEY — strips inline YAML comments and trailing space
-  awk -v k="$2" 'NR==1&&$0!="---"{exit} /^---$/{c++; next} c==1 && $1==k":" {
-    sub(/^[^:]*:[[:space:]]*/,""); sub(/[[:space:]]+#.*$/,""); sub(/[[:space:]]+$/,""); print; exit}' "$1"
+fm_get_stream() { # fm_get_stream KEY < content — strips inline YAML comments/trailing space
+  awk -v k="$1" 'NR==1&&$0!="---"{exit} /^---$/{c++; next} c==1 && $1==k":" {
+    sub(/^[^:]*:[[:space:]]*/,""); sub(/[[:space:]]+#.*$/,""); sub(/[[:space:]]+$/,""); print; exit}'
+}
+fm_get() { fm_get_stream "$2" < "$1"; } # fm_get FILE KEY
+
+default_branch() {
+  local d; d="$(git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"; d="${d#origin/}"
+  [ -n "$d" ] || { git -C "$1" show-ref --verify --quiet refs/heads/main && d=main; }
+  [ -n "$d" ] || { git -C "$1" show-ref --verify --quiet refs/heads/master && d=master; }
+  printf '%s' "${d:-main}"
+}
+
+# Feature state lives ON the feature branch. Resolution order:
+#   live worktree file > branch tip (git show) > checkout file (spec merged to main)
+feature_field() { # REPO NAME KEY
+  local repo="$1" name="$2" key="$3" f
+  f="$repo/.worktrees/$name/specs/$name/spec.md"
+  if [ -f "$f" ]; then fm_get "$f" "$key"; return; fi
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
+    git -C "$repo" show "$name:specs/$name/spec.md" 2>/dev/null | fm_get_stream "$key"; return
+  fi
+  f="$repo/specs/$name/spec.md"
+  [ -f "$f" ] && fm_get "$f" "$key"
+}
+feature_status() { feature_field "$1" "$2" status; }
+feature_deps()   { feature_field "$1" "$2" depends_on | tr -cd '0-9 ,' | tr ',' ' '; }
+
+all_features() { # ชื่อ feature จาก specs/ ใน checkout + local branch NNN-*
+  { for f in "$1"/specs/*/spec.md; do [ -f "$f" ] && basename "$(dirname "$f")"; done
+    git -C "$1" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null | grep -E '^[0-9]{3}-' || true
+  } 2>/dev/null | sort -u
 }
 fm_set_status() { # fm_set_status FILE VALUE — portable (BSD sed has no 0,/re/ address)
   local f="$1" v="$2" tmp
@@ -106,8 +135,11 @@ fm_set_status() { # fm_set_status FILE VALUE — portable (BSD sed has no 0,/re/
   awk -v v="$v" '/^---$/{c++} c==1 && /^status:/ {print "status: " v; next} {print}' "$f" > "$tmp" \
     && mv "$tmp" "$f" || { rm -f "$tmp"; warn "status update failed for $f"; return 1; }
 }
-fm_deps() { # depends_on: [002, 003] -> "002 003"
-  fm_get "$1" depends_on | tr -cd '0-9 ,' | tr ',' ' '
+set_status() { # set_status WORKSPACE NAME VALUE — edit spec in the feature workspace + commit on its branch
+  local ws="$1" name="$2" v="$3"
+  fm_set_status "$ws/specs/$name/spec.md" "$v" || return 1
+  git -C "$ws" add "specs/$name/spec.md" >/dev/null 2>&1
+  git -C "$ws" commit -qm "chore(night-shift): $name status -> $v" >/dev/null 2>&1 || true
 }
 
 # ---------- args ----------
@@ -150,32 +182,30 @@ TOTAL_BUDGET=$(( DEADLINE - START_TS ))
 if [ "$TOTAL_BUDGET" -lt 1200 ]; then MARGIN=15; else MARGIN=120; fi
 
 # ---------- queue ----------
-list_queue() { # list_queue REPO -> lines "STATUS DIRNAME"
-  local repo="$1" f st name
+list_queue() { # list_queue REPO -> lines "STATUS NAME" (state resolved from branch tips too)
+  local repo="$1" st name pass
   for pass in IMPLEMENTING APPROVED; do          # resume-first
-    for f in "$repo"/specs/*/spec.md; do
-      [ -f "$f" ] || continue
-      st="$(fm_get "$f" status)"
+    for name in $(all_features "$repo"); do
+      st="$(feature_status "$repo" "$name")"
       [ "$st" = "$pass" ] || continue
-      name="$(basename "$(dirname "$f")")"
       if [ -n "$NS_ONLY" ]; then
         case ",$NS_ONLY," in *",${name%%-*},"*) ;; *) continue ;; esac
       fi
       printf '%s %s\n' "$st" "$name"
-    done | sort -k2
+    done
   done
 }
 
-deps_satisfied() { # deps_satisfied REPO NAME -> 0/1 + echo base_ref
-  local repo="$1" name="$2" dep depdir depst base="main"
-  for dep in $(fm_deps "$repo/specs/$name/spec.md"); do
-    depdir=$(ls -d "$repo"/specs/${dep}-* 2>/dev/null | head -1) || true
-    [ -z "$depdir" ] && continue
-    depst="$(fm_get "$depdir/spec.md" status)"
+deps_satisfied() { # deps_satisfied REPO NAME DEFAULT_BASE -> 0/1 + echo base_ref
+  local repo="$1" name="$2" base="$3" dep depname depst
+  for dep in $(feature_deps "$repo" "$name"); do
+    depname="$(all_features "$repo" | grep -E "^${dep}-" | head -1 || true)"
+    [ -z "$depname" ] && continue
+    depst="$(feature_status "$repo" "$depname")"
     case "$depst" in
-      DONE) ;;                                        # merged — base stays main
+      DONE) ;;                                        # merged — base stays default
       READY_FOR_HUMAN_REVIEW|READY_WITH_WARNINGS)
-        base="$(basename "$depdir")" ;;               # stack on the dep branch
+        base="$depname" ;;                            # stack on the dep branch
       *) echo ""; return 1 ;;
     esac
   done
@@ -185,32 +215,38 @@ deps_satisfied() { # deps_satisfied REPO NAME -> 0/1 + echo base_ref
 # ---------- per-feature run ----------
 run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   local repo="$1" name="$2" base="$3" report="$4"
-  local spec="$repo/specs/$name/spec.md"
   local wt="$repo/.worktrees/$name"
-  local runlog="$repo/specs/$name/run.log"
+  mkdir -p "$repo/.worktrees"
+  local runlog="$repo/.worktrees/$name.log"   # นอก worktree — อยู่รอดแม้ checkout สลับ branch
   local gatetail; gatetail="$(mktemp)"
 
   log "feature $name (base: $base)"
-  # worktree + branch (reuse when resuming)
-  # speckit's planning chain leaves the main checkout ON the feature branch —
-  # git refuses a second checkout of the same branch, so work there directly.
+  # ALWAYS isolate into a worktree — the human keeps the main checkout.
+  # speckit's planning chain leaves the main checkout ON the feature branch:
+  # snapshot tracked changes onto the branch, move the checkout back to the
+  # default branch, then check the branch out into its worktree.
   local cur; cur="$(git -C "$repo" branch --show-current 2>/dev/null)"
   if [ "$cur" = "$name" ]; then
     if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
-      warn "$name is checked out at the repo root with uncommitted TRACKED changes — commit/stash first"; return 1
+      git -C "$repo" commit -aqm "wip(night-shift): snapshot before isolating into worktree" >>"$runlog" 2>&1 \
+        || { warn "cannot snapshot tracked changes on $name"; return 1; }
+      log "  tracked changes on $name committed as wip snapshot"
     fi
-    wt="$repo"
-    log "  using main checkout (already on branch $name, clean)"
-  elif [ ! -d "$wt" ]; then
+    local def; def="$(default_branch "$repo")"
+    git -C "$repo" switch "$def" >>"$runlog" 2>&1 \
+      || { warn "cannot move main checkout to $def:"; tail -3 "$runlog" >&2; return 1; }
+    log "  main checkout moved to $def — เครื่องคุณว่างแล้ว, $name แยกไป worktree"
+  fi
+  if [ ! -d "$wt" ]; then
     if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
       git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
     else
       git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
     fi
-    [ -x "$repo/.agent/setup.sh" ] && ( cd "$wt" && bash "$repo/.agent/setup.sh" ) >>"$runlog" 2>&1
+    [ -x "$wt/.agent/setup.sh" ] && ( cd "$wt" && bash .agent/setup.sh ) >>"$runlog" 2>&1
   fi
 
-  fm_set_status "$spec" IMPLEMENTING
+  set_status "$wt" "$name" IMPLEMENTING
   export NIGHT_SHIFT=1 NIGHT_SHIFT_REPO="$repo" NIGHT_SHIFT_WORKTREE="$wt"
 
   local agent_cmd="${NS_AGENT_CMD:-claude -p --dangerously-skip-permissions --max-turns $NS_MAX_TURNS --output-format json}"
@@ -219,7 +255,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   while [ $n -lt "$NS_MAX_ITER" ] && [ "$(time_left)" -gt "$MARGIN" ]; do
     n=$((n+1))
     # gate first: a resumed feature may already be green
-    if ( cd "$wt" && bash "$repo/.agent/gate.sh" ) > "$gatetail.out" 2>&1; then rc=0; break; fi
+    if ( cd "$wt" && bash .agent/gate.sh ) > "$gatetail.out" 2>&1; then rc=0; break; fi
     tail -60 "$gatetail.out" > "$gatetail"
     commits_before=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
     log "  iter $n/$NS_MAX_ITER — gate red, dispatching agent ($(   time_left)s left)"
@@ -233,7 +269,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
     if [ -s "$wt/specs/$name/blockers.md" ] && [ "$commits_after" = "$commits_before" ]; then
       stall=$((stall+1))
       if [ $stall -ge 2 ]; then
-        fm_set_status "$spec" NEEDS_HUMAN_DECISION
+        set_status "$wt" "$name" NEEDS_HUMAN_DECISION
         log "  blocked — see specs/$name/blockers.md (moving on)"
         git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
         rm -f "$gatetail" "$gatetail.out"; return 2
@@ -242,7 +278,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   done
 
   if [ $rc -ne 0 ]; then
-    fm_set_status "$spec" FAILED
+    set_status "$wt" "$name" FAILED
     {
       printf '\n## %s · FAILED (autopsy)\n' "$name"
       printf 'iterations: %s/%s · gate tail:\n```\n%s\n```\n' "$n" "$NS_MAX_ITER" "$(cat "$gatetail")"
@@ -251,7 +287,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
     rm -f "$gatetail" "$gatetail.out"; return 1
   fi
 
-  fm_set_status "$spec" REVIEWING
+  set_status "$wt" "$name" REVIEWING
   log "  gate green after $n iteration(s) — finalizing"
   {
     printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\n\n' "$name" "$repo" "$report"
@@ -260,9 +296,9 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
 
   # finalize sets WARN marker file when it logged warnings
   if [ -f "$wt/specs/$name/.warnings" ]; then
-    fm_set_status "$spec" READY_WITH_WARNINGS
+    set_status "$wt" "$name" READY_WITH_WARNINGS
   else
-    fm_set_status "$spec" READY_FOR_HUMAN_REVIEW
+    set_status "$wt" "$name" READY_FOR_HUMAN_REVIEW
   fi
   git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
   rm -f "$gatetail" "$gatetail.out"
@@ -274,19 +310,22 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
 
 for repo in "${REPOS[@]}"; do
   [ -d "$repo/.git" ] || { warn "skip $repo (not a git repo)"; continue; }
-  [ -d "$repo/specs" ] || { warn "skip $repo (no specs/ — run /night-shift:init first)"; continue; }
+  if [ -z "$(all_features "$repo")" ]; then
+    warn "skip $repo (no features found in specs/ or NNN-* branches — run /night-shift:init + /night-shift:feature first)"; continue
+  fi
 
   # per-repo config (adapter point): may set NS_AGENT_CMD, NS_MAX_ITER, NS_REPORT_DIR, ...
   [ -f "$repo/.agent/config" ] && . "$repo/.agent/config"
 
   log "repo: $repo"
+  DEF="$(default_branch "$repo")"
   QUEUE="$(list_queue "$repo")"
   if [ -z "$QUEUE" ]; then log "  queue empty (nothing APPROVED)"; continue; fi
   printf '%s\n' "$QUEUE" | while read -r st name; do log "  queued: $name ($st)"; done
 
   if [ "$CMD" = "status" ] || [ "$NS_DRY_RUN" -eq 1 ]; then continue; fi
 
-  [ -x "$repo/.agent/gate.sh" ] || { warn "skip $repo (.agent/gate.sh missing)"; continue; }
+  [ -x "$repo/.agent/gate.sh" ] || log "  note: .agent/gate.sh not on current checkout — will use the copy inside each worktree"
   if [ -x "$repo/.agent/preflight.sh" ]; then
     if ! bash "$repo/.agent/preflight.sh"; then
       warn "pre-flight failed for $repo — skipping repo (global blocker)"; continue
@@ -307,12 +346,12 @@ for repo in "${REPOS[@]}"; do
 
   printf '%s\n' "$QUEUE" | while read -r st name; do
     [ "$(time_left)" -le "$MARGIN" ] && { log "  deadline reached — stopping"; break; }
-    base="$(deps_satisfied "$repo" "$name")" || { log "  $name waits for depends_on — skipped"; continue; }
-    run_feature "$repo" "$name" "${base:-main}" "$REPORT" || true
+    base="$(deps_satisfied "$repo" "$name" "$DEF")" || { log "  $name waits for depends_on — skipped"; continue; }
+    run_feature "$repo" "$name" "${base:-$DEF}" "$REPORT" || true
   done
 
   # usage summary (best effort)
-  tokens=$(cat "$repo"/specs/*/run.log 2>/dev/null | grep -o '"output_tokens":[0-9]*' | cut -d: -f2 | awk '{s+=$1} END{print s+0}')
+  tokens=$(cat "$repo"/.worktrees/*.log 2>/dev/null | grep -o '"output_tokens":[0-9]*' | cut -d: -f2 | awk '{s+=$1} END{print s+0}')
   printf '\n---\nrun ended %s · approx output tokens this repo (all runs): %s\n' "$(date '+%F %H:%M')" "${tokens:-?}" >> "$REPORT"
 done
 log "done."
