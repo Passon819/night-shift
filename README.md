@@ -36,7 +36,7 @@ tasks → analyze          │   worktree → implement loop    │   findings �
 ## Install (per machine)
 
 ```bash
-claude plugin marketplace add passondevmac/night-shift   # or a local path
+claude plugin marketplace add Passon819/night-shift   # or a local path
 claude plugin install night-shift@night-shift
 ```
 
