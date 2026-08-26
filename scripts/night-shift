@@ -22,7 +22,7 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.2"
+VERSION="0.1.3"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
 
@@ -196,8 +196,8 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   # git refuses a second checkout of the same branch, so work there directly.
   local cur; cur="$(git -C "$repo" branch --show-current 2>/dev/null)"
   if [ "$cur" = "$name" ]; then
-    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
-      warn "$name is checked out at the repo root with uncommitted changes — commit/stash first"; return 1
+    if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
+      warn "$name is checked out at the repo root with uncommitted TRACKED changes — commit/stash first"; return 1
     fi
     wt="$repo"
     log "  using main checkout (already on branch $name, clean)"

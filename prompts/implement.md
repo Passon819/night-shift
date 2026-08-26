@@ -19,7 +19,10 @@ feature's own branch. The human is NOT available — never wait for input.
 - Test-first where the task creates behavior; for bug-type tasks reproduce with
   a failing test before fixing.
 - Mark tasks `[x]` as they complete. Commit ONLY when tests for the completed
-  work pass (green-only commits). Commit message: task id + short description
+  work pass (green-only commits). Stage the specific files you changed
+  (`git add <paths>`) — NEVER `git add -A` / `git add .`: the checkout may hold
+  unrelated untracked files (run reports, scratch docs) that must not enter
+  feature commits. Commit message: task id + short description
   + spec section refs. Do NOT push — the launcher pushes.
 - Stay inside the surface declared in `plan.md`. Do not touch unrelated files.
 - Do NOT edit spec.md frontmatter (status etc.) — the launcher owns it.
