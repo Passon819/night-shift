@@ -12,10 +12,13 @@ instead of restarting.
 
 Prerequisite: the repo must have `.specify/` (else point to /night-shift:init).
 
-1. **Grill** — invoke the `grill-with-docs` skill (fall back to `grilling`, then
-   to asking sharp questions yourself). Interview until the decision tree for
-   this feature is resolved. One topic at a time; offer a recommended answer
-   with each question.
+1. **Grill** — invoke the `grilling` skill (note: `grill-with-docs` is a
+   user-invoke-only stub that expands to `grilling` + `domain-modeling`, so an
+   agent must call the engines directly). Also invoke `domain-modeling` when
+   the feature involves domain/data-model design (skip it for mechanical work
+   like typing fixes or refactors). No grilling skill installed → ask sharp
+   questions yourself in the same style. Interview until the decision tree for
+   this feature is resolved; offer a recommended answer with each question.
 2. **Specify** — invoke `speckit-specify` with the distilled description. The
    spec must include: acceptance criteria (testable, labeled AC-1..N), edge
    cases + error handling, spec-routing (which product-spec sections were read),
