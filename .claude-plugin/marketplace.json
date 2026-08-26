@@ -1,0 +1,11 @@
+{
+  "name": "night-shift",
+  "owner": { "name": "passondevmac" },
+  "plugins": [
+    {
+      "name": "night-shift",
+      "source": "./",
+      "description": "Plan by day, run autonomously while you're away, review from a single report."
+    }
+  ]
+}

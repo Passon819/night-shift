@@ -1,0 +1,8 @@
+# .agent/guard-rules — repo-specific deny rules for the night-shift guard.
+# One POSIX extended regex per line; matched against every Bash command the
+# agent runs during autonomous runs. '#' starts a comment.
+# Company/workspace conventions belong HERE — never in the plugin itself.
+#
+# Example (this workspace): restores may only target databases prefixed drill_
+# pg_restore.*-d[[:space:]]+(?!drill_)   <-- ERE has no lookahead; write it positively:
+# pg_restore[[:space:]].*-d[[:space:]]+(pcu_|prod)

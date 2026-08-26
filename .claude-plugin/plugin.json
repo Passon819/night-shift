@@ -1,0 +1,18 @@
+{
+  "name": "night-shift",
+  "version": "0.1.0",
+  "description": "Plan by day, run autonomously while you're away, review from a single report. Spec-driven autonomous development loop for Claude Code (speckit-compatible, cross-platform).",
+  "author": { "name": "passondevmac" },
+  "homepage": "https://github.com/passondevmac/night-shift",
+  "repository": "https://github.com/passondevmac/night-shift",
+  "license": "MIT",
+  "keywords": ["autonomous", "overnight", "workflow", "speckit", "spec-driven", "runner"],
+  "skills": [
+    "./skills/init",
+    "./skills/feature",
+    "./skills/run-night",
+    "./skills/review-morning",
+    "./skills/schedule"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

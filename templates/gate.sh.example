@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# .agent/gate.sh — the deterministic "is it done?" answer for THIS repo.
+# Generated per repo by /night-shift:init from the real stack. Rules:
+#   - exit non-zero on ANY failure; print enough context to fix it
+#   - fail fast, cheapest checks first
+#   - runs from the worktree root
+set -euo pipefail
+say() { printf '\n== gate: %s ==\n' "$*"; }
+
+say "typecheck"    ; (cd app  && npm run typecheck)
+say "lint"         ; (cd app  && npm run lint)
+say "unit tests"   ; (cd app  && npm test)
+say "build"        ; (cd app  && npm run build)
+# say "go services" ; (cd svc && go vet ./... && go test ./... && go build ./...)
+
+say "diff scope"   # changed files must stay inside the surface plan.md declared
+# BASE=$(git merge-base main HEAD)
+# git diff --name-only "$BASE"...HEAD | grep -vE '^(app/|specs/|docs/report/)' \
+#   && { echo "files outside declared surface"; exit 1; } || true
+
+say "tasks complete"
+# grep -n '^- \[ \]' specs/*/tasks.md && exit 1 || true
+echo "GATE PASS"

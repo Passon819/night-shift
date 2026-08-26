@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# .agent/preflight.sh — OPTIONAL. Verify running dependencies before burning
+# tokens against a dead stack. Non-zero exit skips this repo for the run.
+set -euo pipefail
+# curl -fsS http://localhost:19010/healthz >/dev/null || { echo "ingestion down"; exit 1; }
+# docker compose -f dev-stack/docker-compose.yml ps --status running | grep -q postgres
+exit 0

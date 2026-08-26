@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# night-shift — autonomous run launcher
+#
+# Usage:
+#   night-shift run [repo ...] [--for 8h | --until HH:MM] [--only NNN,NNN]
+#                   [--max-iter N] [--agent "CMD"] [--dry-run]
+#   night-shift status [repo]       # show the queue without running anything
+#   night-shift version
+#
+# A "repo" is a git checkout that has been initialized with /night-shift:init
+# (it must contain specs/ and .agent/gate.sh). With no repo args, the current
+# directory is used. Runs repos sequentially, and features within each repo
+# sequentially, ordered by number and depends_on.
+#
+# The launcher OWNS spec frontmatter status. Agents never edit it.
+# State machine (subset the launcher touches):
+#   APPROVED -> IMPLEMENTING -> REVIEWING -> READY_FOR_HUMAN_REVIEW
+#   plus: READY_WITH_WARNINGS / NEEDS_HUMAN_DECISION / FAILED
+# Resume rule: IMPLEMENTING features are picked before APPROVED ones.
+#
+# Portability: bash only, LF, no flock (mkdir lock), timeout fallback included.
+# Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
+
+set -u
+VERSION="0.1.0"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(dirname "$SELF_DIR")"
+
+# ---------- defaults (overridable per repo via .agent/config) ----------
+NS_FOR="12h"
+NS_UNTIL=""
+NS_ONLY=""
+NS_MAX_ITER=20
+NS_MAX_TURNS=80
+NS_ITER_TIMEOUT=1800     # seconds per agent iteration
+NS_AGENT_CMD=""          # default resolved below; adapter point for codex/glm/kimi
+NS_DRY_RUN=0
+NS_REPORT_DIR="docs/report"
+
+log()  { printf '[night-shift] %s\n' "$*"; }
+warn() { printf '[night-shift] WARN: %s\n' "$*" >&2; }
+die()  { printf '[night-shift] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------- portable helpers ----------
+run_with_timeout() { # run_with_timeout SECONDS cmd...
+  local t="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$t" "$@"
+  else
+    "$@" & local pid=$!
+    ( sleep "$t" && kill -TERM "$pid" 2>/dev/null ) & local wd=$!
+    wait "$pid"; local rc=$?
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    return $rc
+  fi
+}
+
+acquire_lock() {
+  LOCK_DIR="${HOME}/.cache/night-shift/lock"
+  mkdir -p "${HOME}/.cache/night-shift"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "another night-shift run seems active (lock: $LOCK_DIR). Remove the dir if stale."
+  fi
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
+release_lock() { rm -rf "${LOCK_DIR:-}" 2>/dev/null || true; }
+
+KEEPAWAKE_PID=""
+keep_awake() {
+  case "$(uname -s)" in
+    Darwin)
+      caffeinate -i -w $$ & KEEPAWAKE_PID=$! ;;
+    MINGW*|MSYS*|CYGWIN*)
+      powershell.exe -NoProfile -Command '
+        Add-Type -Name P -Namespace W -MemberDefinition "[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint f);";
+        while($true){ [W.P]::SetThreadExecutionState(2147483651) | Out-Null; Start-Sleep 300 }' \
+        >/dev/null 2>&1 & KEEPAWAKE_PID=$! ;;
+    Linux)
+      command -v systemd-inhibit >/dev/null 2>&1 || warn "no keep-awake mechanism found; disable sleep manually" ;;
+  esac
+}
+
+cleanup() {
+  [ -n "$KEEPAWAKE_PID" ] && kill "$KEEPAWAKE_PID" 2>/dev/null
+  release_lock
+}
+trap cleanup EXIT INT TERM
+
+parse_duration() { # "8h" | "90m" -> seconds
+  case "$1" in
+    *h) echo $(( ${1%h} * 3600 )) ;;
+    *m) echo $(( ${1%m} * 60 )) ;;
+    *)  echo "$1" ;;
+  esac
+}
+
+# ---------- frontmatter (launcher-owned) ----------
+fm_get() { # fm_get FILE KEY
+  awk -v k="$2" 'NR==1&&$0!="---"{exit} /^---$/{c++; next} c==1 && $1==k":" {sub(/^[^:]*:[[:space:]]*/,""); print; exit}' "$1"
+}
+fm_set_status() { # fm_set_status FILE VALUE — portable (BSD sed has no 0,/re/ address)
+  local f="$1" v="$2" tmp
+  grep -q '^status:' "$f" || { warn "no status field in $f"; return 1; }
+  tmp="$(mktemp)"
+  awk -v v="$v" '/^---$/{c++} c==1 && /^status:/ {print "status: " v; next} {print}' "$f" > "$tmp" \
+    && mv "$tmp" "$f" || { rm -f "$tmp"; warn "status update failed for $f"; return 1; }
+}
+fm_deps() { # depends_on: [002, 003] -> "002 003"
+  fm_get "$1" depends_on | tr -cd '0-9 ,' | tr ',' ' '
+}
+
+# ---------- args ----------
+CMD="${1:-run}"; shift || true
+case "$CMD" in
+  version) echo "night-shift $VERSION"; exit 0 ;;
+  run|status) ;;
+  *) die "unknown command: $CMD (use: run | status | version)" ;;
+esac
+
+REPOS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --for)      NS_FOR="$2"; shift 2 ;;
+    --until)    NS_UNTIL="$2"; shift 2 ;;
+    --only)     NS_ONLY="$2"; shift 2 ;;
+    --max-iter) NS_MAX_ITER="$2"; shift 2 ;;
+    --agent)    NS_AGENT_CMD="$2"; shift 2 ;;
+    --dry-run)  NS_DRY_RUN=1; shift ;;
+    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         die "unknown flag: $1" ;;
+    *)          REPOS+=("$(cd "$1" 2>/dev/null && pwd || echo "$1")"); shift ;;
+  esac
+done
+[ ${#REPOS[@]} -eq 0 ] && REPOS=("$(pwd)")
+
+# deadline
+START_TS=$(date +%s)
+if [ -n "$NS_UNTIL" ]; then
+  H=${NS_UNTIL%%:*}; M=${NS_UNTIL##*:}
+  NOW_H=$(date +%H); NOW_M=$(date +%M)
+  SECS_TODAY=$(( (10#$H*3600 + 10#$M*60) - (10#$NOW_H*3600 + 10#$NOW_M*60) ))
+  [ $SECS_TODAY -le 0 ] && SECS_TODAY=$(( SECS_TODAY + 86400 ))   # next day
+  DEADLINE=$(( START_TS + SECS_TODAY ))
+else
+  DEADLINE=$(( START_TS + $(parse_duration "$NS_FOR") ))
+fi
+time_left() { echo $(( DEADLINE - $(date +%s) )); }
+TOTAL_BUDGET=$(( DEADLINE - START_TS ))
+if [ "$TOTAL_BUDGET" -lt 1200 ]; then MARGIN=15; else MARGIN=120; fi
+
+# ---------- queue ----------
+list_queue() { # list_queue REPO -> lines "STATUS DIRNAME"
+  local repo="$1" f st name
+  for pass in IMPLEMENTING APPROVED; do          # resume-first
+    for f in "$repo"/specs/*/spec.md; do
+      [ -f "$f" ] || continue
+      st="$(fm_get "$f" status)"
+      [ "$st" = "$pass" ] || continue
+      name="$(basename "$(dirname "$f")")"
+      if [ -n "$NS_ONLY" ]; then
+        case ",$NS_ONLY," in *",${name%%-*},"*) ;; *) continue ;; esac
+      fi
+      printf '%s %s\n' "$st" "$name"
+    done | sort -k2
+  done
+}
+
+deps_satisfied() { # deps_satisfied REPO NAME -> 0/1 + echo base_ref
+  local repo="$1" name="$2" dep depdir depst base="main"
+  for dep in $(fm_deps "$repo/specs/$name/spec.md"); do
+    depdir=$(ls -d "$repo"/specs/${dep}-* 2>/dev/null | head -1) || true
+    [ -z "$depdir" ] && continue
+    depst="$(fm_get "$depdir/spec.md" status)"
+    case "$depst" in
+      DONE) ;;                                        # merged — base stays main
+      READY_FOR_HUMAN_REVIEW|READY_WITH_WARNINGS)
+        base="$(basename "$depdir")" ;;               # stack on the dep branch
+      *) echo ""; return 1 ;;
+    esac
+  done
+  echo "$base"; return 0
+}
+
+# ---------- per-feature run ----------
+run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
+  local repo="$1" name="$2" base="$3" report="$4"
+  local spec="$repo/specs/$name/spec.md"
+  local wt="$repo/.worktrees/$name"
+  local runlog="$repo/specs/$name/run.log"
+  local gatetail; gatetail="$(mktemp)"
+
+  log "feature $name (base: $base)"
+  # worktree + branch (reuse when resuming)
+  if [ ! -d "$wt" ]; then
+    if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
+      git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { warn "worktree add failed"; return 1; }
+    else
+      git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { warn "worktree add failed"; return 1; }
+    fi
+    [ -x "$repo/.agent/setup.sh" ] && ( cd "$wt" && bash "$repo/.agent/setup.sh" ) >>"$runlog" 2>&1
+  fi
+
+  fm_set_status "$spec" IMPLEMENTING
+  export NIGHT_SHIFT=1 NIGHT_SHIFT_REPO="$repo" NIGHT_SHIFT_WORKTREE="$wt"
+
+  local agent_cmd="${NS_AGENT_CMD:-claude -p --dangerously-skip-permissions --max-turns $NS_MAX_TURNS --output-format json}"
+  local n=0 rc=1 commits_before commits_after stall=0
+  : > "$gatetail"
+  while [ $n -lt "$NS_MAX_ITER" ] && [ "$(time_left)" -gt "$MARGIN" ]; do
+    n=$((n+1))
+    # gate first: a resumed feature may already be green
+    if ( cd "$wt" && bash "$repo/.agent/gate.sh" ) > "$gatetail.out" 2>&1; then rc=0; break; fi
+    tail -60 "$gatetail.out" > "$gatetail"
+    commits_before=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
+    log "  iter $n/$NS_MAX_ITER — gate red, dispatching agent ($(   time_left)s left)"
+    {
+      printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\niteration: %s\n' "$name" "$repo" "$report" "$n"
+      printf 'gate_output_tail:\n```\n%s\n```\n\n' "$(cat "$gatetail")"
+      cat "$PLUGIN_ROOT/prompts/implement.md"
+    } | ( cd "$wt" && run_with_timeout "$NS_ITER_TIMEOUT" bash -c "$agent_cmd" ) >>"$runlog" 2>&1
+    commits_after=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
+    # blocker heuristic: blockers.md present and two consecutive no-progress iterations
+    if [ -s "$wt/specs/$name/blockers.md" ] && [ "$commits_after" = "$commits_before" ]; then
+      stall=$((stall+1))
+      if [ $stall -ge 2 ]; then
+        fm_set_status "$spec" NEEDS_HUMAN_DECISION
+        log "  blocked — see specs/$name/blockers.md (moving on)"
+        git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+        rm -f "$gatetail" "$gatetail.out"; return 2
+      fi
+    else stall=0; fi
+  done
+
+  if [ $rc -ne 0 ]; then
+    fm_set_status "$spec" FAILED
+    {
+      printf '\n## %s · FAILED (autopsy)\n' "$name"
+      printf 'iterations: %s/%s · gate tail:\n```\n%s\n```\n' "$n" "$NS_MAX_ITER" "$(cat "$gatetail")"
+    } >> "$report"
+    git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+    rm -f "$gatetail" "$gatetail.out"; return 1
+  fi
+
+  fm_set_status "$spec" REVIEWING
+  log "  gate green after $n iteration(s) — finalizing"
+  {
+    printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\n\n' "$name" "$repo" "$report"
+    cat "$PLUGIN_ROOT/prompts/finalize.md"
+  } | ( cd "$wt" && run_with_timeout "$NS_ITER_TIMEOUT" bash -c "$agent_cmd" ) >>"$runlog" 2>&1
+
+  # finalize sets WARN marker file when it logged warnings
+  if [ -f "$wt/specs/$name/.warnings" ]; then
+    fm_set_status "$spec" READY_WITH_WARNINGS
+  else
+    fm_set_status "$spec" READY_FOR_HUMAN_REVIEW
+  fi
+  git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+  rm -f "$gatetail" "$gatetail.out"
+  return 0
+}
+
+# ---------- main ----------
+[ "$CMD" = "run" ] && [ "$NS_DRY_RUN" -eq 0 ] && { acquire_lock; keep_awake; }
+
+for repo in "${REPOS[@]}"; do
+  [ -d "$repo/.git" ] || { warn "skip $repo (not a git repo)"; continue; }
+  [ -d "$repo/specs" ] || { warn "skip $repo (no specs/ — run /night-shift:init first)"; continue; }
+
+  # per-repo config (adapter point): may set NS_AGENT_CMD, NS_MAX_ITER, NS_REPORT_DIR, ...
+  [ -f "$repo/.agent/config" ] && . "$repo/.agent/config"
+
+  log "repo: $repo"
+  QUEUE="$(list_queue "$repo")"
+  if [ -z "$QUEUE" ]; then log "  queue empty (nothing APPROVED)"; continue; fi
+  printf '%s\n' "$QUEUE" | while read -r st name; do log "  queued: $name ($st)"; done
+
+  if [ "$CMD" = "status" ] || [ "$NS_DRY_RUN" -eq 1 ]; then continue; fi
+
+  [ -x "$repo/.agent/gate.sh" ] || { warn "skip $repo (.agent/gate.sh missing)"; continue; }
+  if [ -x "$repo/.agent/preflight.sh" ]; then
+    if ! bash "$repo/.agent/preflight.sh"; then
+      warn "pre-flight failed for $repo — skipping repo (global blocker)"; continue
+    fi
+  fi
+
+  # report file (WORM: new suffix per run on the same date)
+  mkdir -p "$repo/$NS_REPORT_DIR"
+  base_report="$repo/$NS_REPORT_DIR/agent-run-$(date +%F)"
+  REPORT="$base_report.md"; i=2
+  while [ -e "$REPORT" ]; do REPORT="$base_report-$i.md"; i=$((i+1)); done
+  {
+    printf '# Agent Run — %s\n\n' "$(date '+%F %H:%M')"
+    printf 'repo: %s · deadline: %s · queue:\n' "$repo" "$(date -r "$DEADLINE" '+%H:%M' 2>/dev/null || date -d "@$DEADLINE" '+%H:%M' 2>/dev/null || echo '?')"
+    printf '%s\n' "$QUEUE" | sed 's/^/- /'
+  } > "$REPORT"
+  log "  report: $REPORT"
+
+  printf '%s\n' "$QUEUE" | while read -r st name; do
+    [ "$(time_left)" -le "$MARGIN" ] && { log "  deadline reached — stopping"; break; }
+    base="$(deps_satisfied "$repo" "$name")" || { log "  $name waits for depends_on — skipped"; continue; }
+    run_feature "$repo" "$name" "${base:-main}" "$REPORT" || true
+  done
+
+  # usage summary (best effort)
+  tokens=$(cat "$repo"/specs/*/run.log 2>/dev/null | grep -o '"output_tokens":[0-9]*' | cut -d: -f2 | awk '{s+=$1} END{print s+0}')
+  printf '\n---\nrun ended %s · approx output tokens this repo (all runs): %s\n' "$(date '+%F %H:%M')" "${tokens:-?}" >> "$REPORT"
+done
+log "done."
