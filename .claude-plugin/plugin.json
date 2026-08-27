@@ -1,6 +1,6 @@
 {
   "name": "night-shift",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Plan by day, run autonomously while you're away, review from a single report. Spec-driven autonomous development loop for Claude Code (speckit-compatible, cross-platform).",
   "author": { "name": "Passon819" },
   "homepage": "https://github.com/Passon819/night-shift",

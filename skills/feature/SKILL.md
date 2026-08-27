@@ -22,7 +22,12 @@ Prerequisite: the repo must have `.specify/` (else point to /night-shift:init).
 2. **Specify** — invoke `speckit-specify` with the distilled description. The
    spec must include: acceptance criteria (testable, labeled AC-1..N), edge
    cases + error handling, spec-routing (which product-spec sections were read),
-   and the night-shift frontmatter (`status: DRAFT`, `risk`, `depends_on`).
+   and the night-shift frontmatter (`status: DRAFT`, `risk`, `depends_on`) — the
+   status line MUST carry an inline comment listing every allowed value
+   (`# DRAFT | SPEC_READY | APPROVED | IMPLEMENTING | REVIEWING |
+   READY_FOR_HUMAN_REVIEW | READY_WITH_WARNINGS | NEEDS_HUMAN_DECISION |
+   FAILED | DONE | CANCELLED — APPROVED/DONE are human-only`); the launcher
+   preserves this comment across status transitions.
 3. **Clarify** — invoke `speckit-clarify` (≤5 targeted questions). Encode the
    answers back into the spec. Set `status: SPEC_READY`.
 4. **Plan** — invoke `speckit-plan`. The plan MUST declare the change surface

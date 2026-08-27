@@ -22,7 +22,7 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.4"
+VERSION="0.1.5"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
 
@@ -34,6 +34,8 @@ NS_MAX_ITER=20
 NS_MAX_TURNS=80
 NS_ITER_TIMEOUT=1800     # seconds per agent iteration
 NS_AGENT_CMD=""          # default resolved below; adapter point for codex/glm/kimi
+NS_MODEL=""              # override model for iterations (else: saved settings hierarchy)
+NS_EFFORT=""             # override effort (else: saved settings)
 NS_DRY_RUN=0
 NS_REPORT_DIR="docs/report"
 
@@ -132,7 +134,9 @@ fm_set_status() { # fm_set_status FILE VALUE — portable (BSD sed has no 0,/re/
   local f="$1" v="$2" tmp
   grep -q '^status:' "$f" || { warn "no status field in $f"; return 1; }
   tmp="$(mktemp)"
-  awk -v v="$v" '/^---$/{c++} c==1 && /^status:/ {print "status: " v; next} {print}' "$f" > "$tmp" \
+  awk -v v="$v" '/^---$/{c++} c==1 && /^status:/ {
+      cmt=""; if (match($0, /[[:space:]]+#.*$/)) cmt=substr($0, RSTART)
+      print "status: " v cmt; next } {print}' "$f" > "$tmp" \
     && mv "$tmp" "$f" || { rm -f "$tmp"; warn "status update failed for $f"; return 1; }
 }
 set_status() { # set_status WORKSPACE NAME VALUE — edit spec in the feature workspace + commit on its branch
@@ -158,6 +162,8 @@ while [ $# -gt 0 ]; do
     --only)     NS_ONLY="$2"; shift 2 ;;
     --max-iter) NS_MAX_ITER="$2"; shift 2 ;;
     --agent)    NS_AGENT_CMD="$2"; shift 2 ;;
+    --model)    NS_MODEL_ARG="$2"; shift 2 ;;
+    --effort)   NS_EFFORT_ARG="$2"; shift 2 ;;
     --dry-run)  NS_DRY_RUN=1; shift ;;
     -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)         die "unknown flag: $1" ;;
@@ -249,7 +255,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   set_status "$wt" "$name" IMPLEMENTING
   export NIGHT_SHIFT=1 NIGHT_SHIFT_REPO="$repo" NIGHT_SHIFT_WORKTREE="$wt"
 
-  local agent_cmd="${NS_AGENT_CMD:-claude -p --dangerously-skip-permissions --max-turns $NS_MAX_TURNS --output-format json}"
+  local agent_cmd="${NS_AGENT_CMD:-claude -p --dangerously-skip-permissions --max-turns $NS_MAX_TURNS --output-format json${NS_MODEL:+ --model $NS_MODEL}${NS_EFFORT:+ --effort $NS_EFFORT}}"
   local n=0 rc=1 commits_before commits_after stall=0
   : > "$gatetail"
   while [ $n -lt "$NS_MAX_ITER" ] && [ "$(time_left)" -gt "$MARGIN" ]; do
@@ -314,8 +320,10 @@ for repo in "${REPOS[@]}"; do
     warn "skip $repo (no features found in specs/ or NNN-* branches — run /night-shift:init + /night-shift:feature first)"; continue
   fi
 
-  # per-repo config (adapter point): may set NS_AGENT_CMD, NS_MAX_ITER, NS_REPORT_DIR, ...
+  # per-repo config (adapter point): may set NS_AGENT_CMD, NS_MODEL, NS_EFFORT, NS_MAX_ITER, NS_REPORT_DIR, ...
   [ -f "$repo/.agent/config" ] && . "$repo/.agent/config"
+  [ -n "${NS_MODEL_ARG:-}" ] && NS_MODEL="$NS_MODEL_ARG"      # CLI flag ชนะ config
+  [ -n "${NS_EFFORT_ARG:-}" ] && NS_EFFORT="$NS_EFFORT_ARG"
 
   log "repo: $repo"
   DEF="$(default_branch "$repo")"
