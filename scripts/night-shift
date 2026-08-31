@@ -2,10 +2,15 @@
 # night-shift — autonomous run launcher
 #
 # Usage:
-#   night-shift run [repo ...] [--for 8h | --until HH:MM] [--only NNN,NNN]
-#                   [--max-iter N] [--agent "CMD"] [--dry-run]
-#   night-shift status [repo]       # show the queue without running anything
+#   night-shift run [repo ...] [--for 12h | --until HH:MM] [--only NNN,NNN]
+#                   [--max-iter N] [--agent "CMD"] [--model M] [--effort E]
+#                   [--dry-run]
+#   night-shift status [repo ...] [--only NNN,NNN]   # show the queue, run nothing
 #   night-shift version
+#
+# --only takes zero-padded feature numbers, comma separated, no spaces:
+#   --only 002,003   ✓        --only 2,3 / "002, 003" / full names   ✗
+# In chat, /night-shift:status prints the same queue plus what blocks the rest.
 #
 # A "repo" is a git checkout that has been initialized with /night-shift:init
 # (it must contain specs/ and .agent/gate.sh). With no repo args, the current

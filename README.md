@@ -50,28 +50,87 @@ Scaffolds [spec-kit](https://github.com/github/spec-kit) if missing, writes the
 `.agent/` contract (gate/setup/preflight/guard-rules), fixes gitignore traps,
 installs the `night-shift` shim on PATH.
 
-## Use
+## Two ways to drive it
+
+Skills run **inside a chat session** — planning, reviewing, and supervised runs
+where you watch and can interrupt. The launcher runs **with no session at all**
+— that is the whole point: no window to keep open, no tokens burned while you
+sleep. Same queue semantics either way.
+
+### In chat — skills
+
+| skill | what it does | writes? |
+|---|---|---|
+| `/night-shift:init` | prepare a repo, once — speckit scaffold, `.agent/` contract, PATH shim | yes |
+| `/night-shift:feature <idea>` | plan ONE feature: grill → spec → clarify → plan → tasks → analyze. Stops at `SPEC_READY`; it never signs your approval | yes |
+| `/night-shift:status [--only NNN]` | what would run right now, and what blocks everything else | **no** |
+| `/night-shift:run-night [--only NNN] [--for 2h] [--max-iter N]` | supervised run in this session; defaults are deliberately small (2h, 5 iterations per feature) | yes |
+| `/night-shift:review-morning` | walk the newest run — findings, blocker answers, per-feature merge | yes |
+| `/night-shift:schedule` | optional OS-level schedule (launchd / Task Scheduler) | yes |
+
+### In a terminal — the launcher
 
 ```bash
-# in chat: plan one feature end-to-end (or invoke each speckit skill manually)
-/night-shift:feature  <your idea>
-# you: review artifacts, set status: APPROVED in specs/NNN/spec.md, commit
-
-# in a NORMAL terminal (not the chat) — this is the whole trick:
-night-shift run ~/work/repoA ~/work/repoB --for 8h
-night-shift run --only 004 --until 06:30
-night-shift status            # show the queue, touch nothing
-
-# back in chat, when you return:
-/night-shift:review-morning
+night-shift status [repo ...] [--only NNN,NNN]   # show the queue, touch nothing
+night-shift run    [repo ...] [flags]            # the unattended run
+night-shift version
+night-shift run --help
 ```
+
+| flag | default | notes |
+|---|---|---|
+| `--for DUR` | `12h` | ceiling, not a quota |
+| `--until HH:MM` | — | wall clock, wraps past midnight |
+| `--only NNN,NNN` | all | **zero-padded, no spaces** — `002,003` works, `2,3` and `002, 003` do not |
+| `--max-iter N` | `20` | per feature |
+| `--agent "CMD"` | claude | must read the prompt on stdin |
+| `--model` / `--effort` | saved settings | precedence: CLI > `.agent/config` > saved settings |
+| `--dry-run` | off | resolve queue + run preflight, then stop |
+
+No repo argument = the current directory. Several repos = run them in order.
 
 `--for/--until` is a **ceiling, not a quota**: an empty queue ends the run
 immediately; hitting the ceiling ends the current iteration cleanly, pushes
 green work, and the next run resumes from tasks.md.
 
-Supervised trial mode (watch it work before trusting it):
-`/night-shift:run-night --only 002 --for 2h`
+## Recipes
+
+**Your first feature — before you trust it**
+
+```bash
+/night-shift:feature add CSV export to the report screen
+#  you: read specs/002-*/spec.md, write status: APPROVED + approved_by:, commit
+/night-shift:status                                  # confirm it is queued
+/night-shift:run-night --only 002 --for 1h --max-iter 3
+```
+
+Watch a few iterations, interrupt, then hand the rest to the launcher.
+
+**"Nothing ran last night"** — `/night-shift:status` names the one thing in the
+way of each feature: unsigned spec, unmet `depends_on`, unanswered blockers, or
+a run left mid-flight.
+
+**Tonight, only this one** — approve everything, run one:
+
+```bash
+night-shift run --only 004 --until 06:30
+```
+
+**Two features that touch the same files** — the launcher runs features
+sequentially, but each branches from the same base and merges later, so
+overlapping change surfaces collide at merge time. Chain them instead:
+put `depends_on: [002]` in 003's frontmatter and the launcher stacks 003's
+branch on 002's. Anything touching migrations should always be chained.
+
+**Several repos in one go** — one queue after another, ceiling shared:
+
+```bash
+night-shift run ~/work/repoA ~/work/repoB --for 8h
+```
+
+**A run failed and you want the why** — `FAILED` features get an autopsy block
+appended to `docs/report/agent-run-<date>.md` (iterations used, gate tail).
+`/night-shift:review-morning` opens it for you.
 
 ## Cross-platform
 
