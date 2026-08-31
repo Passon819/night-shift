@@ -27,9 +27,11 @@
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
 
 set -u
-VERSION="0.1.5"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SELF_DIR")"
+# version อ่านจาก plugin.json ที่เดียว — กันเลขสองที่เพี้ยนกันตอน bump (เคยหลุดมาแล้วใน 0.1.6)
+VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null | head -1)"
+[ -n "$VERSION" ] || VERSION="unknown"
 
 # ---------- defaults (overridable per repo via .agent/config) ----------
 NS_FOR="12h"
@@ -170,7 +172,8 @@ while [ $# -gt 0 ]; do
     --model)    NS_MODEL_ARG="$2"; shift 2 ;;
     --effort)   NS_EFFORT_ARG="$2"; shift 2 ;;
     --dry-run)  NS_DRY_RUN=1; shift ;;
-    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # พิมพ์คอมเมนต์หัวไฟล์จนจบบล็อกเอง — ไม่ผูกกับเลขบรรทัด (เคยตัดกลางประโยคตอนหัวไฟล์ยาวขึ้น)
+    -h|--help)  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
     -*)         die "unknown flag: $1" ;;
     *)          REPOS+=("$(cd "$1" 2>/dev/null && pwd || echo "$1")"); shift ;;
   esac
