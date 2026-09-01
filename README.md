@@ -155,9 +155,14 @@ NS_EFFORT=high            # low | medium | high
 ```
 
 Precedence: CLI `--model/--effort` > `.agent/config` > claude saved settings.
-Visibility: the run logs the binding at start (`agent: claude · model=… ·
-effort=…`) and on every new session; after each session it logs the model
-actually used (from the result JSON) and records it in `.worktrees/.last-agent`
+Visibility: the run logs the binding at start and on every new session. When
+nothing is pinned the CLI decides, and there is no supported way to read that
+choice up front — so the launcher says so, hints what the previous run actually
+got (`model=ตามค่าที่ตั้งใน claude (ครั้งก่อนได้ claude-opus-5)`), and from the
+first finished session onward prints the resolved name on every later session
+line. Effort is never reported back by the CLI: pin it if you need certainty.
+After each session it logs the model actually used (from the result JSON) and
+records it in `.worktrees/.last-agent`
 (machine-local) plus the report header/footer — that is what init reads to
 suggest a default next time. In those sources `saved-settings` is a
 placeholder meaning "not pinned", never a value to copy into config;

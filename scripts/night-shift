@@ -303,9 +303,14 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   # productive = จำนวนรอบที่ agent ได้ทำงานจริง — FAILED ตัดสินจากตัวนี้เท่านั้น
   local productive=0 api_wait=0 last_api_msg=""
   # ป้ายกำกับ session: custom agent ไม่ได้รับ --model/--effort จากเรา — อย่าโชว์ค่าที่ไม่ได้ใช้จริง
-  local sess_tag
-  if [ -n "$NS_AGENT_CMD" ]; then sess_tag="custom agent"
-  else sess_tag="model=${NS_MODEL:-saved-settings} effort=${NS_EFFORT:-saved-settings}"; fi
+  # ไม่ pin = claude เลือกตามค่าที่ผู้ใช้ตั้งไว้ ซึ่งอ่านล่วงหน้าไม่ได้ (ไม่มี API ที่รับรอง) —
+  # แต่พอ session แรกจบเรารู้ชื่อจริงจาก result JSON แล้ว จึงโชว์ชื่อนั้นในรอบถัด ๆ ไป
+  sess_desc() {
+    if [ -n "$NS_AGENT_CMD" ]; then printf 'custom agent'; return; fi
+    printf 'model=%s effort=%s' \
+      "${NS_MODEL:-${RESOLVED_MODEL:-ตามค่าที่ตั้งใน claude}}" \
+      "${NS_EFFORT:-ตามค่าที่ตั้งใน claude}"
+  }
 
   # agent_session PROMPT_FILE — รัน agent หนึ่ง session แล้วจำแนกผลลง AGENT_OUTCOME:
   #   ok        = exit 0 + มี result JSON จริง (custom agent: เช็คแค่ exit code)
@@ -334,6 +339,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
     # model ที่ "ใช้จริง" มาจากผลลัพธ์ ไม่ใช่จาก flag — จดให้ init รอบหน้าเสนอเป็น default
     # effort เขียนเฉพาะตอน pin จริง — ห้ามให้ sentinel "saved-settings" หลุดไปเป็นค่า config
     AGENT_MODEL="$(grep -o '"modelUsage":{"[^"]*"' "$iterout" | head -1 | cut -d'"' -f4)"
+    [ -n "$AGENT_MODEL" ] && RESOLVED_MODEL="$AGENT_MODEL"   # ชื่อจริงของรอบนี้ — ใช้แสดงในรอบถัดไป
     AGENT_TOKS="$(grep -o '"output_tokens":[0-9]*' "$iterout" | head -1 | cut -d: -f2)"
     [ -n "$AGENT_MODEL" ] && printf 'model=%s%s at=%s\n' "$AGENT_MODEL" "${NS_EFFORT:+ effort=$NS_EFFORT}" "$(date '+%F %H:%M')" > "$repo/.worktrees/.last-agent"
     AGENT_OUTCOME=ok
@@ -369,7 +375,7 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
     if ( cd "$wt" && bash .agent/gate.sh </dev/null ) > "$gatetail.out" 2>&1; then rc=0; break; fi
     tail -60 "$gatetail.out" > "$gatetail"
     commits_before=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
-    log "  iter $n/$NS_MAX_ITER — gate red → new session: $sess_tag ($(time_left)s left)"
+    log "  iter $n/$NS_MAX_ITER — gate red → new session: $(sess_desc) ($(time_left)s left)"
     {
       printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\niteration: %s\n' "$name" "$repo" "$report" "$n"
       printf 'gate_output_tail:\n```\n%s\n```\n\n' "$(cat "$gatetail")"
@@ -495,8 +501,13 @@ for repo in "${REPOS[@]}"; do
 
   # ให้เห็นเสมอว่า run นี้ผูก agent/model/effort อะไร — ใน terminal, หัว report และ status
   # "saved-settings" = ไม่ได้ pin → claude ใช้ค่าที่ผู้ใช้ตั้งไว้ในเครื่อง (พฤติกรรมเดิม)
+  RESOLVED_MODEL=""
+  last_hint="$(sed -n 's/^model=\([^ ]*\).*/\1/p' "$repo/.worktrees/.last-agent" 2>/dev/null | head -1)"
   if [ -n "$NS_AGENT_CMD" ]; then AGENT_DESC="custom: $NS_AGENT_CMD"
-  else AGENT_DESC="claude · model=${NS_MODEL:-saved-settings} · effort=${NS_EFFORT:-saved-settings}"; fi
+  else
+    AGENT_DESC="claude · model=${NS_MODEL:-ตามค่าที่ตั้งใน claude${last_hint:+ (ครั้งก่อนได้ $last_hint)}} · effort=${NS_EFFORT:-ตามค่าที่ตั้งใน claude}"
+    [ -z "$NS_MODEL$NS_EFFORT" ] && AGENT_DESC="$AGENT_DESC · pin ได้ที่ .agent/config (NS_MODEL/NS_EFFORT)"
+  fi
 
   log "repo: $repo"
   log "  agent: $AGENT_DESC"
