@@ -494,6 +494,15 @@ for repo in "${REPOS[@]}"; do
   [ -n "${NS_MODEL_ARG:-}" ] && NS_MODEL="$NS_MODEL_ARG"      # CLI flag ชนะ config
   [ -n "${NS_EFFORT_ARG:-}" ] && NS_EFFORT="$NS_EFFORT_ARG"
 
+  # effort ที่พิมพ์ผิดจะถูก CLI เมินเงียบ ๆ (warn แล้วรันด้วยค่าเริ่มต้น) — ดักเองให้เห็นชัด
+  # ค่าที่ claude 2.x รับ: low medium high xhigh max (max ส่งได้เฉพาะตอนเรียก ตั้งค้างไม่ได้)
+  EFFORT_NOTE=""
+  case "${NS_EFFORT:-}" in
+    ''|low|medium|high|xhigh|max) ;;
+    *) warn "effort '$NS_EFFORT' ไม่ใช่ค่าที่ claude รับ (low|medium|high|xhigh|max) — ยกเลิก pin แล้วใช้ค่าเริ่มต้นแทน"
+       EFFORT_NOTE=" (pin '$NS_EFFORT' ไม่ถูกต้อง — ถูกยกเลิก)"; NS_EFFORT="" ;;
+  esac
+
   # กัน config/env ใส่ backoff ที่ไม่ใช่ตัวเลขหรือศูนย์ — ค่า 0 จะทำให้ 429 แรก
   # หลุดออกจาก retry loop แล้วกลายเป็น FAILED ปลอม
   case "${NS_API_BACKOFF:-}" in ''|*[!0-9]*) NS_API_BACKOFF=60 ;; esac
@@ -505,7 +514,7 @@ for repo in "${REPOS[@]}"; do
   last_hint="$(sed -n 's/^model=\([^ ]*\).*/\1/p' "$repo/.worktrees/.last-agent" 2>/dev/null | head -1)"
   if [ -n "$NS_AGENT_CMD" ]; then AGENT_DESC="custom: $NS_AGENT_CMD"
   else
-    AGENT_DESC="claude · model=${NS_MODEL:-ตามค่าที่ตั้งใน claude${last_hint:+ (ครั้งก่อนได้ $last_hint)}} · effort=${NS_EFFORT:-ตามค่าที่ตั้งใน claude}"
+    AGENT_DESC="claude · model=${NS_MODEL:-ตามค่าที่ตั้งใน claude${last_hint:+ (ครั้งก่อนได้ $last_hint)}} · effort=${NS_EFFORT:-ตามค่าที่ตั้งใน claude}$EFFORT_NOTE"
     [ -z "$NS_MODEL$NS_EFFORT" ] && AGENT_DESC="$AGENT_DESC · pin ได้ที่ .agent/config (NS_MODEL/NS_EFFORT)"
   fi
 

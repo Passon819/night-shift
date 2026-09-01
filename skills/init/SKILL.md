@@ -45,7 +45,7 @@ references:
   ```bash
   # model/effort หลักของ repo นี้ตอน night run — ลำดับชนะ: CLI --model/--effort > ไฟล์นี้ > claude saved settings
   NS_MODEL=claude-opus-5
-  NS_EFFORT=high
+  NS_EFFORT=high    # low | medium | high | xhigh | max
   ```
 
 ## 3. Spec frontmatter convention

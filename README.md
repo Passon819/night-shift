@@ -151,7 +151,7 @@ this for you, suggesting whatever the repo used last; to create it by hand:
 ```bash
 # .agent/config — model/effort หลักของ repo นี้ตอน night run
 NS_MODEL=claude-opus-5    # any claude model id
-NS_EFFORT=high            # low | medium | high
+NS_EFFORT=high            # low | medium | high | xhigh | max
 ```
 
 Precedence: CLI `--model/--effort` > `.agent/config` > claude saved settings.
@@ -161,6 +161,11 @@ choice up front — so the launcher says so, hints what the previous run actuall
 got (`model=ตามค่าที่ตั้งใน claude (ครั้งก่อนได้ claude-opus-5)`), and from the
 first finished session onward prints the resolved name on every later session
 line. Effort is never reported back by the CLI: pin it if you need certainty.
+Valid effort values are `low medium high xhigh max` (claude 2.x); a value
+outside that set is dropped with a warning instead of being passed on, since
+the CLI would otherwise ignore it silently. `max` cannot be persisted in
+claude's own settings — pinning it here works because the launcher passes
+`--effort` on every session.
 After each session it logs the model actually used (from the result JSON) and
 records it in `.worktrees/.last-agent`
 (machine-local) plus the report header/footer — that is what init reads to
