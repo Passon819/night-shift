@@ -141,6 +141,28 @@ Scripts are plain portable bash: LF, no `flock`, bundled timeout fallback.
 Windows note: `/night-shift:init` sets `core.longpaths` (worktree + node_modules
 exceeds MAX_PATH).
 
+## Pinning model/effort per repo
+
+`.agent/config` is plain bash the launcher sources at run start — pin the
+model/effort for this repo's runs there. No config (or no `NS_MODEL` line) =
+claude's saved settings, the old behavior. `/night-shift:init` offers to write
+this for you, suggesting whatever the repo used last; to create it by hand:
+
+```bash
+# .agent/config — model/effort หลักของ repo นี้ตอน night run
+NS_MODEL=claude-opus-5    # any claude model id
+NS_EFFORT=high            # low | medium | high
+```
+
+Precedence: CLI `--model/--effort` > `.agent/config` > claude saved settings.
+Visibility: the run logs the binding at start (`agent: claude · model=… ·
+effort=…`) and on every new session; after each session it logs the model
+actually used (from the result JSON) and records it in `.worktrees/.last-agent`
+(machine-local) plus the report header/footer — that is what init reads to
+suggest a default next time. In those sources `saved-settings` is a
+placeholder meaning "not pinned", never a value to copy into config;
+`.last-agent` omits `effort=` entirely when effort was not pinned.
+
 ## Swapping the coding agent (codex / glm / kimi / ...)
 
 Everything that matters is agent-agnostic markdown + bash. The single Claude

@@ -11,10 +11,20 @@ is narrated here, and the human may interrupt at any time.
 Parse args from the invocation (defaults: --for 2h, --max-iter 5 per feature).
 
 ## Queue (same semantics as the launcher)
-Scan `specs/*/spec.md` frontmatter. Pick features with status `IMPLEMENTING`
-first (resume), then `APPROVED`, ordered by number, honoring `depends_on`
-(dep must be DONE, or completed this run → stack on its branch). Apply `--only`
-filter if given. Empty queue → say so and stop.
+Scan `specs/*/spec.md` frontmatter. Pick features with status `REVIEWING`
+first (stopped mid-finalize — closest to done), then `IMPLEMENTING` (resume),
+then `APPROVED`, ordered by number, honoring `depends_on` (dep must be DONE,
+READY_FOR_HUMAN_REVIEW, or READY_WITH_WARNINGS — from an earlier run or
+completed this run → stack on its branch; a dep number that matches no feature
+BLOCKS the dependent, with the reason stated). Apply `--only` filter if given.
+Empty queue → say so and stop.
+
+FAILED must be earned: mark `FAILED` only when the agent did real work for the
+full iteration budget and the gate is still red. A system error (API 429/5xx,
+usage limit, deadline) is not a verdict on the feature — wait and retry, or
+leave the current status for the next run to resume. Every feature that
+entered the queue gets its own line in the report (done/failed/skipped/
+not-started + reason) — silence is a bug.
 
 ## Per feature
 1. Create/reuse worktree `.worktrees/<name>` on branch `<name>`; run
@@ -27,9 +37,11 @@ filter if given. Empty queue → say so and stop.
      one-line summary per iteration.
 3. Gate green → run `${CLAUDE_PLUGIN_ROOT}/prompts/finalize.md` steps (one-pass
    review report-only, post-impact, report section into docs/report/agent-run-<date>.md).
-4. Set final status (READY_FOR_HUMAN_REVIEW / READY_WITH_WARNINGS /
-   NEEDS_HUMAN_DECISION / FAILED), push the branch (never to main), move to the
-   next feature.
+4. Set the final status honestly: READY_FOR_HUMAN_REVIEW / READY_WITH_WARNINGS /
+   NEEDS_HUMAN_DECISION — or FAILED only when it was earned (real agent work for
+   the full budget, gate still red). On a system error (API limit, crash,
+   timeout) LEAVE the current status (IMPLEMENTING / REVIEWING) so the next run
+   resumes it. Push the branch (never to main), move to the next feature.
 
 ## End of run
 Print: per-feature outcomes, blockers awaiting answers, the report file path,

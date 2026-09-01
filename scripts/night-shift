@@ -21,7 +21,13 @@
 # State machine (subset the launcher touches):
 #   APPROVED -> IMPLEMENTING -> REVIEWING -> READY_FOR_HUMAN_REVIEW
 #   plus: READY_WITH_WARNINGS / NEEDS_HUMAN_DECISION / FAILED
-# Resume rule: IMPLEMENTING features are picked before APPROVED ones.
+# Resume rule: REVIEWING > IMPLEMENTING > APPROVED (ตัวที่ใกล้เสร็จสุดก่อน)
+#
+# FAILED ต้อง "earn": ตีตราเฉพาะเมื่อ agent ได้ทำงานจริงจนครบโควตา iteration
+# แล้ว gate ยังแดง — error จากระบบ (API 429/5xx, หมดเวลา) ไม่ใช่ข้อสรุปเกี่ยวกับ
+# feature: รอแล้วลองใหม่ หรือคงสถานะเดิมไว้ให้รอบหน้า resume เอง
+# กติการายงาน: ทุก feature ที่เข้าคิวตอนเริ่ม ต้องมีหัวข้อของตัวเองใน report ตอนจบ
+# (เสร็จ/ล้ม/ข้าม/เริ่มไม่ได้) — ความเงียบคือบั๊ก
 #
 # Portability: bash only, LF, no flock (mkdir lock), timeout fallback included.
 # Works on macOS and on Windows under Git Bash (the shell Claude Code requires).
@@ -40,6 +46,7 @@ NS_ONLY=""
 NS_MAX_ITER=20
 NS_MAX_TURNS=80
 NS_ITER_TIMEOUT=1800     # seconds per agent iteration
+NS_API_BACKOFF="${NS_API_BACKOFF:-60}"  # วินาทีเริ่มต้นรอเมื่อ API ตอบ error (ทบต้น, cap 30 นาที) — env override ได้เพื่อเทสต์
 NS_AGENT_CMD=""          # default resolved below; adapter point for codex/glm/kimi
 NS_MODEL=""              # override model for iterations (else: saved settings hierarchy)
 NS_EFFORT=""             # override effort (else: saved settings)
@@ -198,7 +205,8 @@ if [ "$TOTAL_BUDGET" -lt 1200 ]; then MARGIN=15; else MARGIN=120; fi
 # ---------- queue ----------
 list_queue() { # list_queue REPO -> lines "STATUS NAME" (state resolved from branch tips too)
   local repo="$1" st name pass
-  for pass in IMPLEMENTING APPROVED; do          # resume-first
+  # resume-first: REVIEWING (ค้าง finalize — ใกล้เสร็จสุด) > IMPLEMENTING > APPROVED
+  for pass in REVIEWING IMPLEMENTING APPROVED; do
     for name in $(all_features "$repo"); do
       st="$(feature_status "$repo" "$name")"
       [ "$st" = "$pass" ] || continue
@@ -214,7 +222,9 @@ deps_satisfied() { # deps_satisfied REPO NAME DEFAULT_BASE -> 0/1 + echo base_re
   local repo="$1" name="$2" base="$3" dep depname depst
   for dep in $(feature_deps "$repo" "$name"); do
     depname="$(all_features "$repo" | grep -E "^${dep}-" | head -1 || true)"
-    [ -z "$depname" ] && continue
+    # dep ที่หาไม่เจอ (พิมพ์เลขผิด/ถูกลบ) = block ไม่ใช่ปล่อยผ่านเงียบ ๆ —
+    # รันต่อแปลว่า build ทับ base ที่ไม่มีของที่ spec บอกว่าต้องมี
+    [ -z "$depname" ] && { echo ""; return 1; }
     depst="$(feature_status "$repo" "$depname")"
     case "$depst" in
       DONE) ;;                                        # merged — base stays default
@@ -226,6 +236,20 @@ deps_satisfied() { # deps_satisfied REPO NAME DEFAULT_BASE -> 0/1 + echo base_re
   echo "$base"; return 0
 }
 
+deps_unmet() { # deps_unmet REPO NAME -> รายชื่อ dep ที่ยังไม่พร้อม "NNN-name(STATUS)" (ว่าง = พร้อมหมด)
+  local repo="$1" name="$2" dep depname depst out=""
+  for dep in $(feature_deps "$repo" "$name"); do
+    depname="$(all_features "$repo" | grep -E "^${dep}-" | head -1 || true)"
+    [ -z "$depname" ] && { out="$out ${dep}(ไม่พบ feature)"; continue; }
+    depst="$(feature_status "$repo" "$depname")"
+    case "$depst" in
+      DONE|READY_FOR_HUMAN_REVIEW|READY_WITH_WARNINGS) ;;
+      *) out="$out $depname(${depst:-?})" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
 # ---------- per-feature run ----------
 run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   local repo="$1" name="$2" base="$3" report="$4"
@@ -233,6 +257,16 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   mkdir -p "$repo/.worktrees"
   local runlog="$repo/.worktrees/$name.log"   # นอก worktree — อยู่รอดแม้ checkout สลับ branch
   local gatetail; gatetail="$(mktemp)"
+  local iterout; iterout="$(mktemp)"          # ผลลัพธ์ของ agent call ล่าสุด (tail จาก runlog) — ไว้จำแนกผล
+  local promptf; promptf="$(mktemp)"          # prompt ของ session ปัจจุบัน — ส่งให้ agent ทาง stdin
+
+  tmpclean() { rm -f "$gatetail" "$gatetail.out" "$iterout" "$promptf"; }
+
+  bail() { # bail REASON — เริ่มงานไม่ได้: ลง report เสมอ ไม่ใช่แค่ stderr (ความเงียบคือบั๊ก)
+    warn "$1:"; tail -3 "$runlog" >&2 2>/dev/null || true
+    { printf '\n## %s · เริ่มไม่ได้ — %s\n```\n%s\n```\n' "$name" "$1" "$(tail -3 "$runlog" 2>/dev/null)"; } >> "$report"
+    tmpclean
+  }
 
   log "feature $name (base: $base)"
   # ALWAYS isolate into a worktree — the human keeps the main checkout.
@@ -243,21 +277,21 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   if [ "$cur" = "$name" ]; then
     if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
       git -C "$repo" commit -aqm "wip(night-shift): snapshot before isolating into worktree" >>"$runlog" 2>&1 \
-        || { warn "cannot snapshot tracked changes on $name"; return 1; }
+        || { bail "cannot snapshot tracked changes on $name"; return 1; }
       log "  tracked changes on $name committed as wip snapshot"
     fi
     local def; def="$(default_branch "$repo")"
     git -C "$repo" switch "$def" >>"$runlog" 2>&1 \
-      || { warn "cannot move main checkout to $def:"; tail -3 "$runlog" >&2; return 1; }
+      || { bail "cannot move main checkout to $def"; return 1; }
     log "  main checkout moved to $def — เครื่องคุณว่างแล้ว, $name แยกไป worktree"
   fi
   if [ ! -d "$wt" ]; then
     if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
-      git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
+      git -C "$repo" worktree add "$wt" "$name" >>"$runlog" 2>&1 || { bail "worktree add failed"; return 1; }
     else
-      git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { warn "worktree add failed:"; tail -3 "$runlog" >&2; return 1; }
+      git -C "$repo" worktree add -b "$name" "$wt" "$base" >>"$runlog" 2>&1 || { bail "worktree add failed"; return 1; }
     fi
-    [ -x "$wt/.agent/setup.sh" ] && ( cd "$wt" && bash .agent/setup.sh ) >>"$runlog" 2>&1
+    [ -x "$wt/.agent/setup.sh" ] && ( cd "$wt" && bash .agent/setup.sh </dev/null ) >>"$runlog" 2>&1
   fi
 
   set_status "$wt" "$name" IMPLEMENTING
@@ -265,19 +299,95 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
 
   local agent_cmd="${NS_AGENT_CMD:-claude -p --dangerously-skip-permissions --max-turns $NS_MAX_TURNS --output-format json${NS_MODEL:+ --model $NS_MODEL}${NS_EFFORT:+ --effort $NS_EFFORT}}"
   local n=0 rc=1 commits_before commits_after stall=0
+  # ระบบพัง ≠ งานล้มเหลว: รอบที่ API ตอบ error หรือ agent ตายโดยไม่มีผลลัพธ์ ไม่นับโควตา
+  # productive = จำนวนรอบที่ agent ได้ทำงานจริง — FAILED ตัดสินจากตัวนี้เท่านั้น
+  local productive=0 api_wait=0 last_api_msg=""
+  # ป้ายกำกับ session: custom agent ไม่ได้รับ --model/--effort จากเรา — อย่าโชว์ค่าที่ไม่ได้ใช้จริง
+  local sess_tag
+  if [ -n "$NS_AGENT_CMD" ]; then sess_tag="custom agent"
+  else sess_tag="model=${NS_MODEL:-saved-settings} effort=${NS_EFFORT:-saved-settings}"; fi
+
+  # agent_session PROMPT_FILE — รัน agent หนึ่ง session แล้วจำแนกผลลง AGENT_OUTCOME:
+  #   ok        = exit 0 + มี result JSON จริง (custom agent: เช็คแค่ exit code)
+  #   api_error = API ตอบ error (AGENT_ERR = HTTP status, AGENT_MSG = ข้อความ)
+  #   sys_error = ตายโดยไม่มีผลลัพธ์ — timeout kill, exit 127, CLI พ่น text ล้วน
+  # stream ลง runlog ตรง ๆ (ทน crash — เขียนถึงไหนอยู่ถึงนั่น) แล้ว tail เฉพาะส่วนของ
+  # call นี้มาไว้ที่ iterout เพื่อ parse
+  agent_session() {
+    local log_off rc_agent
+    [ -f "$runlog" ] || : > "$runlog"
+    log_off=$(( $(wc -c < "$runlog") ))
+    ( cd "$wt" && run_with_timeout "$NS_ITER_TIMEOUT" bash -c "$agent_cmd" ) < "$1" >>"$runlog" 2>&1
+    rc_agent=$?
+    tail -c +$((log_off+1)) "$runlog" > "$iterout" 2>/dev/null || : > "$iterout"
+    AGENT_ERR="$(grep -o '"api_error_status":[0-9]*' "$iterout" | head -1 | cut -d: -f2)"
+    AGENT_MSG="$(grep -o '"result":"[^"]*"' "$iterout" | head -1 | cut -d'"' -f4)"
+    if [ -n "$AGENT_ERR" ]; then AGENT_OUTCOME=api_error; return 0; fi
+    if [ "$rc_agent" -ne 0 ]; then
+      AGENT_MSG="agent exited rc=$rc_agent (timeout/crash — ดูท้าย .worktrees/$name.log)"
+      AGENT_OUTCOME=sys_error; return 0
+    fi
+    if [ -z "$NS_AGENT_CMD" ] && ! grep -q '"type":"result"' "$iterout"; then
+      AGENT_MSG="no result JSON from claude (ดูท้าย .worktrees/$name.log)"
+      AGENT_OUTCOME=sys_error; return 0
+    fi
+    # model ที่ "ใช้จริง" มาจากผลลัพธ์ ไม่ใช่จาก flag — จดให้ init รอบหน้าเสนอเป็น default
+    # effort เขียนเฉพาะตอน pin จริง — ห้ามให้ sentinel "saved-settings" หลุดไปเป็นค่า config
+    AGENT_MODEL="$(grep -o '"modelUsage":{"[^"]*"' "$iterout" | head -1 | cut -d'"' -f4)"
+    AGENT_TOKS="$(grep -o '"output_tokens":[0-9]*' "$iterout" | head -1 | cut -d: -f2)"
+    [ -n "$AGENT_MODEL" ] && printf 'model=%s%s at=%s\n' "$AGENT_MODEL" "${NS_EFFORT:+ effort=$NS_EFFORT}" "$(date '+%F %H:%M')" > "$repo/.worktrees/.last-agent"
+    AGENT_OUTCOME=ok
+  }
+
+  transient_api() { case "$1" in 429|5??) return 0 ;; *) return 1 ;; esac; }  # 4xx อื่น = auth/config พัง — retry ไม่ช่วย
+
+  backoff_wait() { # รอทบต้นก่อนลองใหม่ · return 1 = เวลาไม่พอรอแล้ว
+    if [ "$api_wait" -lt "$NS_API_BACKOFF" ]; then api_wait="$NS_API_BACKOFF"; else api_wait=$((api_wait*2)); fi
+    [ "$api_wait" -gt 1800 ] && api_wait=1800    # cap 30 นาที — ยิงซ้ำตอนโดน limit ไม่เสีย token อยู่แล้ว
+    local slack=$(( $(time_left) - MARGIN ))
+    [ "$api_wait" -gt "$slack" ] && api_wait="$slack"
+    [ "$api_wait" -le 0 ] && return 1
+    log "  รอ ${api_wait}s แล้วลองใหม่ (ไม่นับ iteration)"
+    sleep "$api_wait"
+  }
+
+  stop_permanent() { # API ปฏิเสธถาวร (401/403/…) — retry ทั้งคืนไม่ช่วย ต้องคนแก้ต้นเหตุ
+    {
+      printf '\n## %s · หยุด — API ปฏิเสธถาวร (%s)\n' "$name" "${AGENT_ERR:-?}"
+      printf '%s\nแก้ต้นเหตุ (token/config) แล้วรันใหม่ — สถานะคงเดิมไว้ resume ได้\n' "${AGENT_MSG:-no detail}"
+    } >> "$report"
+    log "  api error ${AGENT_ERR:-?} — permanent (auth/config) · หยุด feature นี้"
+    git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+    tmpclean
+  }
+
   : > "$gatetail"
   while [ $n -lt "$NS_MAX_ITER" ] && [ "$(time_left)" -gt "$MARGIN" ]; do
     n=$((n+1))
     # gate first: a resumed feature may already be green
-    if ( cd "$wt" && bash .agent/gate.sh ) > "$gatetail.out" 2>&1; then rc=0; break; fi
+    # (</dev/null — gate ที่เผลออ่าน stdin ห้ามกลืนรายชื่อคิวที่ pipe เข้ามาใน main loop)
+    if ( cd "$wt" && bash .agent/gate.sh </dev/null ) > "$gatetail.out" 2>&1; then rc=0; break; fi
     tail -60 "$gatetail.out" > "$gatetail"
     commits_before=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
-    log "  iter $n/$NS_MAX_ITER — gate red, dispatching agent ($(   time_left)s left)"
+    log "  iter $n/$NS_MAX_ITER — gate red → new session: $sess_tag ($(time_left)s left)"
     {
       printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\niteration: %s\n' "$name" "$repo" "$report" "$n"
       printf 'gate_output_tail:\n```\n%s\n```\n\n' "$(cat "$gatetail")"
       cat "$PLUGIN_ROOT/prompts/implement.md"
-    } | ( cd "$wt" && run_with_timeout "$NS_ITER_TIMEOUT" bash -c "$agent_cmd" ) >>"$runlog" 2>&1
+    } > "$promptf"
+    agent_session "$promptf"
+    if [ "$AGENT_OUTCOME" != ok ]; then
+      n=$((n-1))                                   # ไม่ใช่ผลงานของ agent — คืนโควตา
+      last_api_msg="${AGENT_MSG:-agent call failed}"
+      if [ "$AGENT_OUTCOME" = api_error ] && ! transient_api "$AGENT_ERR"; then
+        stop_permanent; return 3                   # สถานะคง IMPLEMENTING — แก้ต้นเหตุแล้วรันใหม่
+      fi
+      log "  ${AGENT_ERR:+api error $AGENT_ERR — }${AGENT_MSG:-no detail}"
+      backoff_wait || break
+      continue
+    fi
+    productive=$((productive+1)); api_wait=0; last_api_msg=""
+    log "  ↳ session จบ: model=${AGENT_MODEL:-?} · output ${AGENT_TOKS:-?} tokens"
     commits_after=$(git -C "$wt" rev-list --count HEAD 2>/dev/null || echo 0)
     # blocker heuristic: blockers.md present and two consecutive no-progress iterations
     if [ -s "$wt/specs/$name/blockers.md" ] && [ "$commits_after" = "$commits_before" ]; then
@@ -285,20 +395,33 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
       if [ $stall -ge 2 ]; then
         set_status "$wt" "$name" NEEDS_HUMAN_DECISION
         log "  blocked — see specs/$name/blockers.md (moving on)"
+        { printf '\n## %s · NEEDS_HUMAN_DECISION\nคำถามอยู่ที่ `specs/%s/blockers.md` — เขียนคำตอบลงไป แล้วแก้ status กลับเป็น APPROVED\n' "$name" "$name"; } >> "$report"
         git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
-        rm -f "$gatetail" "$gatetail.out"; return 2
+        tmpclean; return 2
       fi
     else stall=0; fi
   done
 
   if [ $rc -ne 0 ]; then
+    # gate ยังแดง — แยกให้ออกว่า "feature ล้มเหลวจริง" หรือ "ระบบไม่เปิดโอกาสให้ทำ"
+    if [ "$(time_left)" -le "$MARGIN" ] || [ "$productive" -eq 0 ]; then
+      # หมดเวลา / ระบบล่มทั้งคืน — คง IMPLEMENTING ไว้ resume rule จะหยิบตัวนี้ก่อนในรอบหน้า
+      {
+        printf '\n## %s · หยุดกลางคัน — resume รอบหน้าอัตโนมัติ (สถานะคง IMPLEMENTING)\n' "$name"
+        printf 'productive iterations: %s · เหตุ: %s\n' "$productive" \
+          "$([ -n "$last_api_msg" ] && printf 'ระบบสะดุดล่าสุด: %s' "$last_api_msg" || echo 'หมดเวลาตาม deadline')"
+      } >> "$report"
+      log "  stopped mid-run (productive=$productive) — จะ resume รอบหน้า ไม่ใช่ FAILED"
+      git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+      tmpclean; return 3
+    fi
     set_status "$wt" "$name" FAILED
     {
       printf '\n## %s · FAILED (autopsy)\n' "$name"
-      printf 'iterations: %s/%s · gate tail:\n```\n%s\n```\n' "$n" "$NS_MAX_ITER" "$(cat "$gatetail")"
+      printf 'iterations: %s/%s (productive: %s) · gate tail:\n```\n%s\n```\n' "$n" "$NS_MAX_ITER" "$productive" "$(cat "$gatetail")"
     } >> "$report"
     git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
-    rm -f "$gatetail" "$gatetail.out"; return 1
+    tmpclean; return 1
   fi
 
   set_status "$wt" "$name" REVIEWING
@@ -306,7 +429,30 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
   {
     printf 'CONTEXT\nfeature_dir: specs/%s\nrepo_root: %s\nreport_file: %s\n\n' "$name" "$repo" "$report"
     cat "$PLUGIN_ROOT/prompts/finalize.md"
-  } | ( cd "$wt" && run_with_timeout "$NS_ITER_TIMEOUT" bash -c "$agent_cmd" ) >>"$runlog" 2>&1
+  } > "$promptf"
+  # finalize ใช้กติกาเดียวกับ loop: สะดุดชั่วคราว → รอแล้วลองใหม่ (429 แวบเดียวตอนตี 1
+  # ต้องไม่ทำให้รอถึงคืนถัดไป) · ปฏิเสธถาวร/หมดเวลา → คง REVIEWING ให้รอบหน้า finalize ต่อ
+  api_wait=0
+  while :; do
+    agent_session "$promptf"
+    [ "$AGENT_OUTCOME" = ok ] && break
+    if [ "$AGENT_OUTCOME" = api_error ] && ! transient_api "$AGENT_ERR"; then
+      stop_permanent; return 3                     # สถานะคง REVIEWING
+    fi
+    log "  finalize สะดุด: ${AGENT_ERR:+api error $AGENT_ERR — }${AGENT_MSG:-no detail}"
+    if ! backoff_wait; then
+      # ห้ามประกาศ READY ทั้งที่ finalize ไม่เคยรันจบ — คง REVIEWING ไว้:
+      # list_queue หยิบ REVIEWING กลับมาก่อนใครในรอบหน้า
+      {
+        printf '\n## %s · gate เขียวแล้ว แต่ finalize ยังไม่จบ\n' "$name"
+        printf 'สถานะคง REVIEWING — รอบหน้าจะ finalize ต่ออัตโนมัติ · %s\n' "${AGENT_MSG:-no detail}"
+      } >> "$report"
+      log "  finalize ไม่จบ — คง REVIEWING ไว้ resume รอบหน้า"
+      git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
+      tmpclean; return 3
+    fi
+  done
+  log "  ↳ finalize จบ: model=${AGENT_MODEL:-?}"
 
   # finalize sets WARN marker file when it logged warnings
   if [ -f "$wt/specs/$name/.warnings" ]; then
@@ -315,14 +461,23 @@ run_feature() { # run_feature REPO NAME BASE_REF REPORT_FILE
     set_status "$wt" "$name" READY_FOR_HUMAN_REVIEW
   fi
   git -C "$wt" push -u origin "$name" >>"$runlog" 2>&1 || warn "push failed for $name"
-  rm -f "$gatetail" "$gatetail.out"
+  tmpclean
   return 0
 }
 
 # ---------- main ----------
 [ "$CMD" = "run" ] && [ "$NS_DRY_RUN" -eq 0 ] && { acquire_lock; keep_awake; }
 
+# ค่าตั้งต้น (defaults + CLI) ก่อนอ่าน .agent/config ของ repo ใด ๆ — ต้อง restore ทุกรอบ
+# ไม่งั้น config ของ repo แรกรั่วไปคุม repo ถัดไป (pin เป็นเรื่องต่อ repo ตามที่ README สัญญา)
+BASE_MAX_ITER=$NS_MAX_ITER; BASE_MAX_TURNS=$NS_MAX_TURNS; BASE_ITER_TIMEOUT=$NS_ITER_TIMEOUT
+BASE_AGENT_CMD=$NS_AGENT_CMD; BASE_MODEL=$NS_MODEL; BASE_EFFORT=$NS_EFFORT
+BASE_REPORT_DIR=$NS_REPORT_DIR; BASE_API_BACKOFF=$NS_API_BACKOFF
+
 for repo in "${REPOS[@]}"; do
+  NS_MAX_ITER=$BASE_MAX_ITER; NS_MAX_TURNS=$BASE_MAX_TURNS; NS_ITER_TIMEOUT=$BASE_ITER_TIMEOUT
+  NS_AGENT_CMD=$BASE_AGENT_CMD; NS_MODEL=$BASE_MODEL; NS_EFFORT=$BASE_EFFORT
+  NS_REPORT_DIR=$BASE_REPORT_DIR; NS_API_BACKOFF=$BASE_API_BACKOFF
   [ -d "$repo/.git" ] || { warn "skip $repo (not a git repo)"; continue; }
   if [ -z "$(all_features "$repo")" ]; then
     warn "skip $repo (no features found in specs/ or NNN-* branches — run /night-shift:init + /night-shift:feature first)"; continue
@@ -333,11 +488,25 @@ for repo in "${REPOS[@]}"; do
   [ -n "${NS_MODEL_ARG:-}" ] && NS_MODEL="$NS_MODEL_ARG"      # CLI flag ชนะ config
   [ -n "${NS_EFFORT_ARG:-}" ] && NS_EFFORT="$NS_EFFORT_ARG"
 
+  # กัน config/env ใส่ backoff ที่ไม่ใช่ตัวเลขหรือศูนย์ — ค่า 0 จะทำให้ 429 แรก
+  # หลุดออกจาก retry loop แล้วกลายเป็น FAILED ปลอม
+  case "${NS_API_BACKOFF:-}" in ''|*[!0-9]*) NS_API_BACKOFF=60 ;; esac
+  [ "$NS_API_BACKOFF" -lt 1 ] && NS_API_BACKOFF=1
+
+  # ให้เห็นเสมอว่า run นี้ผูก agent/model/effort อะไร — ใน terminal, หัว report และ status
+  # "saved-settings" = ไม่ได้ pin → claude ใช้ค่าที่ผู้ใช้ตั้งไว้ในเครื่อง (พฤติกรรมเดิม)
+  if [ -n "$NS_AGENT_CMD" ]; then AGENT_DESC="custom: $NS_AGENT_CMD"
+  else AGENT_DESC="claude · model=${NS_MODEL:-saved-settings} · effort=${NS_EFFORT:-saved-settings}"; fi
+
   log "repo: $repo"
+  log "  agent: $AGENT_DESC"
   DEF="$(default_branch "$repo")"
   QUEUE="$(list_queue "$repo")"
   if [ -z "$QUEUE" ]; then log "  queue empty (nothing APPROVED)"; continue; fi
-  printf '%s\n' "$QUEUE" | while read -r st name; do log "  queued: $name ($st)"; done
+  printf '%s\n' "$QUEUE" | while read -r st name; do
+    unmet="$(deps_unmet "$repo" "$name")"
+    log "  queued: $name ($st)${unmet:+ — depends_on ยังไม่พร้อม: $unmet}"
+  done
 
   if [ "$CMD" = "status" ] || [ "$NS_DRY_RUN" -eq 1 ]; then continue; fi
 
@@ -355,19 +524,38 @@ for repo in "${REPOS[@]}"; do
   while [ -e "$REPORT" ]; do REPORT="$base_report-$i.md"; i=$((i+1)); done
   {
     printf '# Agent Run — %s\n\n' "$(date '+%F %H:%M')"
-    printf 'repo: %s · deadline: %s · queue:\n' "$repo" "$(date -r "$DEADLINE" '+%H:%M' 2>/dev/null || date -d "@$DEADLINE" '+%H:%M' 2>/dev/null || echo '?')"
+    printf 'repo: %s · deadline: %s · agent: %s · queue:\n' "$repo" "$(date -r "$DEADLINE" '+%H:%M' 2>/dev/null || date -d "@$DEADLINE" '+%H:%M' 2>/dev/null || echo '?')" "$AGENT_DESC"
     printf '%s\n' "$QUEUE" | sed 's/^/- /'
   } > "$REPORT"
   log "  report: $REPORT"
 
   printf '%s\n' "$QUEUE" | while read -r st name; do
-    [ "$(time_left)" -le "$MARGIN" ] && { log "  deadline reached — stopping"; break; }
-    base="$(deps_satisfied "$repo" "$name" "$DEF")" || { log "  $name waits for depends_on — skipped"; continue; }
+    [ "$(time_left)" -le "$MARGIN" ] && {
+      log "  deadline reached — stopping"
+      printf '\n## %s (และตัวถัดไปในคิว) · ยังไม่ถึงคิว — หมดเวลาก่อน\n' "$name" >> "$REPORT"
+      break
+    }
+    base="$(deps_satisfied "$repo" "$name" "$DEF")" || {
+      unmet="$(deps_unmet "$repo" "$name")"
+      log "  $name waits for depends_on — skipped (${unmet:-?})"
+      printf '\n## %s · ข้าม — depends_on ยังไม่พร้อม: %s\n' "$name" "${unmet:-?}" >> "$REPORT"
+      continue
+    }
     run_feature "$repo" "$name" "${base:-$DEF}" "$REPORT" || true
   done
 
+  # ทุกชื่อที่เข้าคิวตอนเริ่ม ต้อง audit ได้ในบรรทัดเดียวว่าจบที่สถานะไหน
+  {
+    printf '\n## สรุปคิว (สถานะตอนเริ่ม → ตอนจบ)\n'
+    printf '%s\n' "$QUEUE" | while read -r st name; do
+      printf -- '- %s: %s → %s\n' "$name" "$st" "$(feature_status "$repo" "$name")"
+    done
+  } >> "$REPORT"
+
   # usage summary (best effort)
   tokens=$(cat "$repo"/.worktrees/*.log 2>/dev/null | grep -o '"output_tokens":[0-9]*' | cut -d: -f2 | awk '{s+=$1} END{print s+0}')
-  printf '\n---\nrun ended %s · approx output tokens this repo (all runs): %s\n' "$(date '+%F %H:%M')" "${tokens:-?}" >> "$REPORT"
+  last_agent="$(cat "$repo/.worktrees/.last-agent" 2>/dev/null || true)"
+  printf '\n---\nrun ended %s · agent: %s%s · approx output tokens this repo (all runs): %s\n' \
+    "$(date '+%F %H:%M')" "$AGENT_DESC" "${last_agent:+ · ใช้จริงล่าสุด: $last_agent}" "${tokens:-?}" >> "$REPORT"
 done
 log "done."

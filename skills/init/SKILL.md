@@ -30,6 +30,23 @@ references:
   HERE, never in the plugin). Include a comment header explaining the format.
 - `.agent/config` — only if defaults need overriding (NS_REPORT_DIR,
   NS_MAX_ITER, NS_AGENT_CMD adapter for other coding agents).
+- **Model/effort (one optional question, always ask it):** "pin a model/effort
+  for this repo's night runs?" Build the options from what this repo actually
+  used last: read `.worktrees/.last-agent` (machine-local, written by the
+  launcher after every session), else the `agent:` line in the newest
+  `docs/report/agent-run-*.md`. Offer that pair as the recommended option,
+  plus "skip". Skip = write nothing — the launcher then follows claude's saved
+  settings (the old behavior). **Sentinel rule:** the literal `saved-settings`
+  (seen in report headers/log lines) means "not pinned" — it is NOT a value;
+  never offer it and never write `NS_MODEL=saved-settings` /
+  `NS_EFFORT=saved-settings`. `.last-agent` omits the `effort=` field entirely
+  when effort was not pinned. If chosen, write into `.agent/config`:
+
+  ```bash
+  # model/effort หลักของ repo นี้ตอน night run — ลำดับชนะ: CLI --model/--effort > ไฟล์นี้ > claude saved settings
+  NS_MODEL=claude-opus-5
+  NS_EFFORT=high
+  ```
 
 ## 3. Spec frontmatter convention
 Ensure the spec template (`.specify/templates/spec-template.md`) carries the
