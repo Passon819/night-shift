@@ -89,6 +89,16 @@ night-shift run --help
 
 No repo argument = the current directory. Several repos = run them in order.
 
+**Iterations end for ordinary reasons.** Hitting `--max-turns` is not a failure:
+the agent commits what it finished, the next iteration re-runs the gate and
+continues from tasks.md. The launcher classifies a session by its result JSON,
+never by exit code (claude exits non-zero on max-turns), so those iterations
+count as progress and are not delayed. Genuine crashes (no result JSON) retry on
+a short ladder (15s→5m); API limits retry on their own ladder, and when the
+error message names a reset time the launcher waits until then instead of
+guessing. A session killed mid-flight that still produced commits counts as
+progress too.
+
 `--for/--until` is a **ceiling, not a quota**: an empty queue ends the run
 immediately; hitting the ceiling ends the current iteration cleanly, pushes
 green work, and the next run resumes from tasks.md.
